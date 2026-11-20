@@ -8,6 +8,10 @@
 //  3. POST {port} to $MAKEFUN_ENV_URL/register and retry until accepted.
 //  4. GET $MAKEFUN_ENV_URL/done until it answers {"done": true}.
 //  5. Close the server and exit 0 so the env writes the export the scorer reads.
+//
+// This entrypoint and the service it boots (app.ts, with graphql.ts and mcp.ts)
+// were authored by this make.fun entry agent session and revised across assistant
+// messages (thinking_revised: app.ts takes its final content from two messages).
 
 import { createApp } from './app.ts';
 

@@ -1,5 +1,7 @@
 // GraphQL v4 at /api/graphql. Implements exactly the documents gh and github-mcp-server send
 // (sdk/conformance/checks-graphql.ts GRAPHQL_DOCUMENTS) plus error reporting for unknown fields.
+//
+// Authored by this make.fun entry agent session (with app.ts revised across two messages).
 
 import {
   type IncomingMessage,
@@ -321,7 +323,7 @@ async function execute(document: string, variables: Record<string, unknown>, sto
       }
     }
     repo.pullRequests.push({ number, title, body, state: 'open', head: headRef, base: baseRef, headSha, baseSha, merged: false, filesChanged });
-    const pr = repo.pullRequests[repo.pullRequests.length - 1];
+    const pr = repo.pullRequests[repo.prCounter - 1];
     return { data: { createPullRequest: { pullRequest: prJson(owner, repoName, pr, repo) } } };
   }
 

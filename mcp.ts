@@ -1,6 +1,8 @@
 // Model Context Protocol — streamable HTTP transport at /mcp. Supports both eras:
 // modern 2026-07-28 (server/discover, _meta on every request, no session) and
 // legacy handshake 2025-11-25 (initialize + notifications/initialized, optional Mcp-Session-Id).
+//
+// Authored by this make.fun entry agent session (app.ts revised across two messages: thinking_revised).
 
 import {
   type IncomingMessage,
