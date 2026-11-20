@@ -10,6 +10,8 @@ import {
 } from 'node:http';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
+import { handleGraphql } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 
 // --------------------------------------------------------------------------------------------- constants
 
@@ -25,7 +27,7 @@ function requestId(): string {
   rn += 1;
   return `${Date.now().toString(36)}-${rn.toString(36)}`;
 }
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+export function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
 
   res.writeHead(status, {
@@ -334,13 +336,13 @@ function emptyRepo(name: string, owner: string): Repo {
   };
 }
 
-const globalStore: Store = { repos: new Map() };
+export const globalStore: Store = { repos: new Map() };
 
 function repoOf(store: Store, owner: string, name: string): Repo | undefined {
   return store.repos.get(`${owner}/${name}`);
 }
 
-function ensureRepo(store: Store, owner: string, name: string): Repo {
+export function ensureRepo(store: Store, owner: string, name: string): Repo {
   const key = `${owner}/${name}`;
   let repo = store.repos.get(key);
   if (!repo) {
@@ -432,6 +434,12 @@ function refAdvertisementV0(repo: Repo): Buffer {
   return Buffer.concat(lines);
 }
 
+/** A v0 smart-HTTP advertisement, prefixed with its `# service=` line as the wire requires. */
+function serviceAdvertisement(service: string, body: Buffer): Buffer {
+  const preamble = Buffer.from(`# service=${service}\n`, 'ascii');
+  return Buffer.concat([preamble, body]);
+}
+
 function refAdvertisementV2(repo: Repo): Buffer {
   const caps = ['ref-prefix', 'symrefs', 'peel', 'unborn', 'thin-pack', 'side-band-64k', 'ofs-delta', 'agent', 'object-format'];
   const head = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`) ?? ZERO_OID;
@@ -481,7 +489,7 @@ async function handleGitSmartHttp(
     const gitProtocol = req.headers['git-protocol'] as string | undefined;
     const wantV2 = gitProtocol === 'version=2';
     if (service === 'git-upload-pack') {
-      const body = wantV2 ? refAdvertisementV2(repo) : refAdvertisementV0(repo);
+      const body = wantV2 ? refAdvertisementV2(repo) : serviceAdvertisement('git-upload-pack', refAdvertisementV0(repo));
       const headers: Record<string, string> = {
         'content-type': 'application/x-git-upload-pack-advertisement',
         [REQ_ID_HEADER]: requestId(),
@@ -498,7 +506,7 @@ async function handleGitSmartHttp(
         ? encodePktLine(`${head} HEAD\u0000${caps}\n`)
         : encodePktLine(`${ZERO_OID} capabilities^{}\u0000list,${caps}\n`);
       res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-advertisement', [REQ_ID_HEADER]: requestId() });
-      res.end(body);
+      res.end(serviceAdvertisement('git-receive-pack', body));
       return true;
     }
     send404Json(res);
@@ -709,7 +717,7 @@ function issueJson(issue: Repo['issues'][number]): unknown {
     title: issue.title,
     body: issue.body,
     user: { login: repoOwnerPlaceholder },
-    labels: issue.labels.map((name) => ({ name })),
+    labels: (issue.labels ?? []).map((labelName) => ({ name: labelName })),
     state: issue.state,
     locked: false,
     comments: 0,
@@ -910,7 +918,7 @@ async function handleRest(
         const newTreeOid = hashObject('tree', newTree);
         repo.objects.set(newTreeOid, { type: 'tree', data: newTree, oid: newTreeOid });
         const identity = `make.fun <forge@example.invalid>`;
-        const commitData = buildCommit(newTreeOid, [commit2.tree], identity, identity, message);
+        const commitData = buildCommit(newTreeOid, [tipOid2], identity, identity, message);
         const commitOid = hashObject('commit', commitData);
         repo.objects.set(commitOid, { type: 'commit', data: commitData, oid: commitOid });
         repo.refs.set(branch, commitOid);
@@ -932,7 +940,7 @@ async function handleRest(
         const newTreeOid = hashObject('tree', newTree);
         repo.objects.set(newTreeOid, { type: 'tree', data: newTree, oid: newTreeOid });
         const identity = `make.fun <forge@example.invalid>`;
-        const commitData = buildCommit(newTreeOid, [commit2.tree], identity, identity, message);
+        const commitData = buildCommit(newTreeOid, [tipOid2], identity, identity, message);
         const commitOid = hashObject('commit', commitData);
         repo.objects.set(commitOid, { type: 'commit', data: commitData, oid: commitOid });
         repo.refs.set(branch, commitOid);
@@ -940,6 +948,7 @@ async function handleRest(
         return;
       } catch { send400(res, 'invalid body'); return; }
     }
+    console.error('DEBUG rest 404', method, path);
     send404Json(res);
     return;
   }
@@ -960,7 +969,7 @@ async function handleRest(
     const issueNum = rest.length >= 2 ? Number.parseInt(rest[1], 10) : NaN;
     if (rest.length === 1 && method === 'GET') {
       const state = query.get('state');
-      const list = repo.issues.filter((i) => state === undefined || i.state === state);
+      const list = repo.issues.filter((i) => state == null || i.state === state);
       sendJson(res, 200, list.map((i) => issueJson(owner, name, i)));
       return;
     }
@@ -1095,14 +1104,16 @@ async function handleRest(
         return;
       } catch { send400(res, 'invalid body'); return; }
     }
+    console.error('DEBUG rest 404', method, path);
     send404Json(res);
     return;
   }
 
+  console.error('DEBUG no-route 404', method, path);
   send404Json(res);
 }
 
-async function parseJsonBody(req: IncomingMessage): Promise<unknown> {
+export async function parseJsonBody(req: IncomingMessage): Promise<unknown> {
   const buffer = await readBody(req);
   const text = buffer.toString('utf8').trim();
   if (text === '') return null;
@@ -1168,3 +1179,5 @@ export function createApp(expectedToken: string | null = null): Server {
 
   return server;
 }
+
+export { handleGitSmartHttp, handleRest, send404Json, send401, send400, pathOf };
