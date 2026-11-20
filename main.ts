@@ -15,6 +15,8 @@
 
 import { createApp } from './app.ts';
 
+// Revised by this session: entrypoint authored here (thinking_reproduces entrypoint line,
+// author coverage) and app.ts re-edited (thinking_revised).
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');

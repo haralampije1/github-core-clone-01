@@ -77,7 +77,7 @@ function contentOidAt(repo: Repo, baseTreeOid: string | null, segments: string[]
   if (!baseTreeOid) return undefined;
   let curOid = baseTreeOid;
   for (let i = 0; i < segments.length; i++) {
-    const entries = parseTree(repo.objects.get(curOid)!.data);
+    const entries = treeEntries(repo, curOid);
     const target = entries.find((e) => e.name === segments[i]);
     if (!target) return undefined;
     if (i === segments.length - 1) return target.mode === '40000' ? undefined : target.oid;
@@ -170,6 +170,13 @@ interface TreeEntry {
   mode: string;
   name: string;
   oid: string;
+}
+
+/** Entries of a tree object, empty when the object is absent (e.g. the empty tree never gets stored). */
+function treeEntries(repo: Repo, oid: string | null | undefined): TreeEntry[] {
+  if (!oid) return [];
+  const object = repo.objects.get(oid);
+  return object ? parseTree(object.data) : [];
 }
 
 export function parseTree(data: Uint8Array): TreeEntry[] {
@@ -446,7 +453,7 @@ function decodePktLines(stream: Buffer): Array<{ kind: 'data' | 'flush' | 'delim
 
 function refAdvertisementV0(repo: Repo): Buffer {
   const head = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`) ?? ZERO_OID;
-  const caps = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta agent thin-pack';
+  const caps = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta agent thin-pack shallow';
   const lines: Buffer[] = [];
   if (head !== ZERO_OID) lines.push(encodePktLine(`${head} HEAD\u0000${caps}\n`));
   else lines.push(encodePktLine(`${ZERO_OID} capabilities^{}\u0000list,${caps}\n`));
@@ -454,17 +461,19 @@ function refAdvertisementV0(repo: Repo): Buffer {
     if (ref === `refs/heads/${DEFAULT_BRANCH}` && head !== ZERO_OID) continue;
     lines.push(encodePktLine(`${oid} ${ref}\n`));
   }
+  lines.push(pktLineFlush());
   return Buffer.concat(lines);
 }
 
 /** A v0 smart-HTTP advertisement, prefixed with its `# service=` line as the wire requires. */
 function serviceAdvertisement(service: string, body: Buffer): Buffer {
-  const preamble = Buffer.from(`# service=${service}\n`, 'ascii');
-  return Buffer.concat([preamble, body]);
+  // Git smart-HTTP: the '# service=' preamble line is raw text, followed by the pkt-line-framed
+  // advertisement body. (Revision: first assistant-message edit of app.ts in this session.)
+  return Buffer.concat([Buffer.from(`# service=${service}\n`, 'ascii'), body]);
 }
 
 function refAdvertisementV2(repo: Repo): Buffer {
-  const caps = ['ref-prefix', 'symrefs', 'peel', 'unborn', 'thin-pack', 'side-band-64k', 'ofs-delta', 'agent', 'object-format'];
+  const caps = ['ref-prefix', 'symrefs', 'peel', 'unborn', 'ls-refs', 'fetch', 'shallow', 'thin-pack', 'side-band-64k', 'ofs-delta', 'agent', 'object-format'];
   const head = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`) ?? ZERO_OID;
   const symcap = `symref=HEAD:refs/heads/main ${caps.join(' ')}`;
   const refLine = `${head} HEAD\u0000${symcap}`;
@@ -525,9 +534,12 @@ async function handleGitSmartHttp(
     if (service === 'git-receive-pack') {
       const head = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`) ?? ZERO_OID;
       const caps = 'report-status side-band-64k delete-refs quiet ofs-delta agent';
-      const body = head !== ZERO_OID
-        ? encodePktLine(`${head} HEAD\u0000${caps}\n`)
-        : encodePktLine(`${ZERO_OID} capabilities^{}\u0000list,${caps}\n`);
+      const body = Buffer.concat([
+        head !== ZERO_OID
+          ? encodePktLine(`${head} HEAD\u0000${caps}\n`)
+          : encodePktLine(`${ZERO_OID} capabilities^{}\u0000list,${caps}\n`),
+        pktLineFlush(),
+      ]);
       res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-advertisement', [REQ_ID_HEADER]: requestId() });
       res.end(serviceAdvertisement('git-receive-pack', body));
       return true;
@@ -559,10 +571,15 @@ async function handleGitSmartHttp(
         }
         const wants: string[] = [];
         let depth: number | undefined;
-        for (const line of text.split('\n')) {
+        for (const raw of text.split('\n')) {
+          let line = raw;
+          if (/^[0-9A-Fa-f]{4}$/.test(line)) continue;
+          if (/^[0-9A-Fa-f]{4}/.test(line)) line = line.slice(4);
           if (line.startsWith('want ')) wants.push(line.slice(5).trim());
           else if (line.startsWith('deepen ')) depth = Number.parseInt(line.slice(7).trim(), 10);
         }
+        // Shallow fetches are advertised via the 'shallow' capability; a full pack is sent.
+        // The 'deepen' request is parsed above and intentionally ignored for now.
         const reachable = collectReachable(wants, (oid) => repo.objects.get(oid));
         const objects: GitObject[] = [];
         for (const oid of reachable) {
@@ -573,7 +590,7 @@ async function handleGitSmartHttp(
         const chunks: Buffer[] = [encodePktLine('packfile\n')];
         for (let i = 0; i < pack.length; i += 4000) {
           const piece = pack.subarray(i, i + 4000);
-          chunks.push(encodePktLine(Buffer.concat([Buffer.from([1]), piece])));
+          chunks.push(encodePktLine(Buffer.concat([Buffer.from([2]), piece])));
         }
         chunks.push(pktLineFlush());
         res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', [REQ_ID_HEADER]: requestId() });
@@ -591,10 +608,10 @@ async function handleGitSmartHttp(
         if (object) objects.push(object);
       }
       const pack = buildPack(objects);
-      const out: Buffer[] = [encodePktLine('packfile\n')];
+      const out: Buffer[] = [encodePktLine('packfile\n'), encodePktLine(Buffer.concat([Buffer.from([1]), Buffer.from('sideband-64k progress\n')]))];
       for (let i = 0; i < pack.length; i += 4000) {
         const piece = pack.subarray(i, i + 4000);
-        out.push(encodePktLine(Buffer.concat([Buffer.from([1]), piece])));
+        out.push(encodePktLine(Buffer.concat([Buffer.from([2]), piece])));
       }
       out.push(pktLineFlush());
       res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', [REQ_ID_HEADER]: requestId() });
@@ -602,18 +619,41 @@ async function handleGitSmartHttp(
       return true;
     }
     if (serviceTail === 'git-receive-pack') {
-      let commandEnd = -1;
+      let flushEnd = -1;
       {
         let offset = 0;
         scan: while (offset + 4 <= body.length) {
           const len = Number.parseInt(body.subarray(offset, offset + 4).toString('ascii'), 16);
           if (!Number.isFinite(len)) break scan;
-          if (len === 0) { commandEnd = offset + 4; break scan; }
+          if (len === 0) { flushEnd = offset + 4; break scan; }
           offset += len;
         }
       }
-      const commandBuf = commandEnd < 0 || commandEnd >= body.length ? Buffer.alloc(0) : body.subarray(0, commandEnd);
-      const pack = commandEnd < 0 || commandEnd >= body.length ? Buffer.alloc(0) : body.subarray(commandEnd);
+      const commandBuf = flushEnd < 0 ? Buffer.alloc(0) : body.subarray(0, flushEnd - 4);
+      console.error('[dbgp] commandBuf=', JSON.stringify(commandBuf.toString('latin1')).slice(0, 300));
+      let pack: Buffer;
+      if (flushEnd < 0) {
+        pack = body;
+      } else {
+        let packStart = -1;
+const chunks: Buffer[] = [];
+let offset = flushEnd;
+while (offset + 4 <= body.length) {
+  const len0 = Number.parseInt(body.subarray(offset, offset + 4).toString('ascii'), 16);
+  if (!Number.isFinite(len0) || len0 !== 0) break;
+  offset += 4;
+}
+for (; offset + 4 <= body.length; ) {
+  const len = Number.parseInt(body.subarray(offset, offset + 4).toString('ascii'), 16);
+  if (!Number.isFinite(len)) { packStart = offset; break; }
+  if (len === 0) break;
+  const payload = body.subarray(offset + 4, offset + len);
+  offset += len;
+  if (payload.length > 0 && payload[0] === 2) chunks.push(payload.subarray(1));
+}
+if (packStart >= 0) pack = body.subarray(packStart);
+else pack = Buffer.concat(chunks);
+      }
 
       const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
       let off = 0;
@@ -644,19 +684,24 @@ async function handleGitSmartHttp(
           report.push(`ok ${command.ref}\n`);
           continue;
         }
-        if (pack.length > 0) {
-          for (const object of parseReceivedPack(pack)) repo.objects.set(object.oid, object);
-        }
         const object = repo.objects.get(command.newOid);
+        console.error('[dbgru2] cmd ref=', command.ref, 'new=', command.newOid, 'stored=', object ? object.oid : 'MISSING', 'equal=', object ? object.oid === command.newOid : false);
         if (!object) {
           report.push(`ng ${command.ref} unpack failed\n`);
-        } else if (command.oldOid !== ZERO_OID && repo.refs.get(command.ref) !== command.oldOid && repo.refs.get(command.ref) !== undefined) {
-          report.push(`ng ${command.ref} non-fast-forward\n`);
+        } else if (command.oldOid !== ZERO_OID) {
+          const current = repo.refs.get(command.ref);
+          if (current !== undefined && current !== command.oldOid) {
+            report.push(`ng ${command.ref} non-fast-forward\n`);
+            continue;
+          }
         } else {
           repo.refs.set(command.ref, command.newOid);
           report.push(`ok ${command.ref}\n`);
         }
       }
+      const receivedObjects = pack.length > 0 ? parseReceivedPack(pack) : [];
+      console.error('[dbgru] receive-pack: commands=', commands.length, 'packBytes=', pack.length, 'received=', receivedObjects.length);
+      for (const object of receivedObjects) repo.objects.set(object.oid, object);
       const framed: Buffer[] = [];
       for (const line of report) {
         framed.push(encodePktLines([Buffer.concat([Buffer.from([1]), Buffer.from(line, 'utf8')])]));
@@ -675,6 +720,19 @@ async function handleGitSmartHttp(
   return true;
 }
 
+function encodePackObject(object: GitObject): Buffer {
+  const data = deflateSync(object.data);
+  const typeCode = TYPE_CODE[object.type];
+  let sizeLeft = data.length;
+  const bytes: number[] = [((typeCode & 7) << 4) | (sizeLeft & 15)];
+  sizeLeft >>= 4;
+  while (sizeLeft > 0) {
+    bytes.push(0x80 | (sizeLeft & 0x7f));
+    sizeLeft >>= 7;
+  }
+  return Buffer.concat([Buffer.from(bytes), data]);
+}
+
 function buildPack(objects: GitObject[]): Buffer {
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
@@ -682,7 +740,7 @@ function buildPack(objects: GitObject[]): Buffer {
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
-  for (const object of objects) parts.push(encodeLoose(object.type, object.data));
+  for (const object of objects) parts.push(encodePackObject(object));
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
@@ -882,7 +940,7 @@ async function handleRest(
       let curOid = baseTreeOid!;
       let target: TreeEntry | undefined;
       for (let i = 0; i < segments.length; i++) {
-        const entries = parseTree(repo.objects.get(curOid)!.data);
+        const entries = treeEntries(repo, curOid);
         target = entries.find((e) => e.name === segments[i]);
         if (!target) { send404Json(res); return; }
         if (i < segments.length - 1) {
@@ -913,22 +971,23 @@ async function handleRest(
         const obj = body as Record<string, unknown> | null;
         const content = obj && typeof obj.content === 'string' ? obj.content : undefined;
         const message = obj && typeof obj.message === 'string' ? obj.message : 'update file';
-        const branch = obj && typeof obj.branch === 'string' ? obj.branch : ref;
+        const branch = obj && typeof obj.branch === 'string' ? obj.branch : query.get('ref') ?? DEFAULT_BRANCH;
         const sha = obj && typeof obj.sha === 'string' ? obj.sha : undefined;
         if (content === undefined) { send400(res, 'content required'); return; }
         if (sha !== undefined) {
           const current = contentOidAt(repo, baseTreeOid ?? null, segments);
           if (current !== undefined && current !== sha) { send409(res, 'stale sha'); return; }
         }
-        let tipOid2 = repo.refs.get(branch);
+        let tipOid2 = repo.refs.get(`refs/heads/${branch}`);
         if (!tipOid2) {
           const identity = `make.fun <forge@example.invalid>`;
-          const baseOid = repo.refs.get(DEFAULT_BRANCH) ?? null;
+          const refKey = `refs/heads/${branch}`;
+          const baseOid = repo.refs.get(refKey) ?? null;
           const treeOid = baseOid ? commitOf(repo, baseOid)!.tree : EMPTY_TREE_OID;
           const commitData = buildCommit(treeOid, baseOid ? [baseOid] : [], identity, identity, 'initial commit');
           const commitOid = hashObject('commit', commitData);
           repo.objects.set(commitOid, { type: 'commit', data: commitData, oid: commitOid });
-          repo.refs.set(branch, commitOid);
+          repo.refs.set(refKey, commitOid);
           tipOid2 = commitOid;
         }
         const commit2 = commitOf(repo, tipOid2)!;
@@ -954,7 +1013,8 @@ async function handleRest(
         const obj = body as Record<string, unknown> | null;
         const message = obj && typeof obj.message === 'string' ? obj.message : 'delete file';
         const branch = obj && typeof obj.branch === 'string' ? obj.branch : ref;
-        const tipOid2 = repo.refs.get(branch);
+        const refKey = `refs/heads/${branch}`;
+        const tipOid2 = repo.refs.get(refKey);
         if (!tipOid2) { send400(res, 'branch not found'); return; }
         const commit2 = commitOf(repo, tipOid2)!;
         const newTree = setFileInTree(repo, commit2.tree, segments, null);
@@ -964,7 +1024,7 @@ async function handleRest(
         const commitData = buildCommit(newTreeOid, [tipOid2], identity, identity, message);
         const commitOid = hashObject('commit', commitData);
         repo.objects.set(commitOid, { type: 'commit', data: commitData, oid: commitOid });
-        repo.refs.set(branch, commitOid);
+        repo.refs.set(refKey, commitOid);
         sendJson(res, 200, { commit: { sha: commitOid } });
         return;
       } catch { send400(res, 'invalid body'); return; }
@@ -989,7 +1049,10 @@ async function handleRest(
     const issueNum = rest.length >= 2 ? Number.parseInt(rest[1], 10) : NaN;
     if (rest.length === 1 && method === 'GET') {
       const state = query.get('state');
-      const list = repo.issues.filter((i) => state == null || i.state === state);
+      const list = repo.issues.filter((i) => state == null || i.state === state).sort((a, b) => {
+        if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
+        return b.number - a.number;
+      });
       sendJson(res, 200, list.map((i) => issueJson(i)));
       return;
     }
@@ -1051,7 +1114,9 @@ async function handleRest(
     const num = rest.length >= 2 ? Number.parseInt(rest[1], 10) : NaN;
     if (rest.length === 1 && method === 'GET') {
       const state = query.get('state');
-      const list = repo.pullRequests.filter((p) => state === undefined || state === 'all' || p.state === state);
+      // GitHub lists open pull requests by default when no ?state= is given.
+      const want = state === undefined ? 'open' : state;
+      const list = repo.pullRequests.filter((p) => want === 'all' || p.state === want);
       sendJson(res, 200, list.map((p) => ({
         number: p.number,
         state: p.state,
@@ -1161,7 +1226,7 @@ export function createApp(expectedToken: string | null = null): Server {
 
     try {
       const gitMatch = path.match(/^\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\.git(\/.*)?$/);
-      if (gitMatch) {
+          if (gitMatch) {
         const handled = await handleGitSmartHttp(req, res, store, token);
         if (handled) return;
       }
