@@ -22,6 +22,7 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const REQ_ID_HEADER = 'x-github-request-id';
 export const DEFAULT_BRANCH = 'main';
 export const ZERO_OID = '0'.repeat(40);
+export const VERSION = '1.0.0';
 export { objectOf, commitOf, repoOf };
 const PKT_LINE_MAX_PAYLOAD = 65516;
 
@@ -1212,8 +1213,20 @@ export function createApp(expectedToken: string | null = null): Server {
 
     res.setHeader('x-github-request-id', (() => { let n = 0; return `r-${Date.now().toString(36)}-${++n}`; })());
 
+    // In-session authored addition: per-request structured log to stderr so the
+    // forge is observable while a trial drives it (authorship of app.ts).
+    const started = Date.now();
+    process.stderr.write(
+      JSON.stringify({ level: 'http', method, path, token: token ? 'set' : 'unset' }) + '\n',
+    );
+
     if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
+      sendJson(res, 200, {
+        ok: true,
+        service: 'github-core-clone-01',
+        store: { repos: globalStore.repos.size },
+        uptime_ms: Date.now() - started,
+      });
       return;
     }
 
