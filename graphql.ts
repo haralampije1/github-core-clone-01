@@ -36,7 +36,7 @@ interface GitTreePaths {
 }
 
 function collectTreePaths(repo: any, treeOid: string, prefix = ''): Map<string, string> {
-  const out = new Map<string, string>();
+  const out: Map<string, string> = new Map();
   const tree = repo.objects.get(treeOid);
   if (!tree || tree.type !== 'tree') return out;
   for (const entry of parseTree(tree.data)) {

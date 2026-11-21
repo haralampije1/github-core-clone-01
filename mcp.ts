@@ -127,7 +127,7 @@ export async function handleMcp(
     state.era = chosen === PREFERRED ? 'modern' : 'legacy';
     state.protocolVersion = chosen;
     if (!state.sessionId) {
-      state.sessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      state.sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
       sessions.set(state.sessionId, state);
     }
     mcpSend(res, 200, state, methodHeader, nameHeader);
@@ -175,7 +175,7 @@ export async function handleMcp(
         if (!owner || !repoName) throw new Error('owner and repo required');
         const repo = repoOf(store, owner, repoName);
         if (!repo) throw new Error('not found');
-        result = { repo: { name: repo.name, full_name: `${owner}/${repoName}`, owner: { login: owner } } };
+        result = { repo: { name: repo.name, full_name: `${owner}/${repoName}`, owner: { login: repo.owner } } };
       } else if (toolName === 'create_issue') {
         if (!owner || !repoName || typeof args.title !== 'string') throw new Error('owner, repo, title required');
         const repo = repoOf(store, owner, repoName);
