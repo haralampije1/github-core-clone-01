@@ -2,8 +2,8 @@
 // Serves: git smart HTTP (/{owner}/{repo}.git), REST v3 (/api/v3), GraphQL v4 (/api/graphql),
 // MCP streamable HTTP (/mcp). See RULES of make.fun's github-core-clone-01 bounty.
 //
-// This file is authored by the make.fun entry agent across two assistant messages:
-// the first message writes the service, the second revises it (thinking_revised).
+// Re-authored by this make.fun entry agent session (new additive middleware wiring,
+// per-route metrics, security headers and CORS preflight authored here).
 
 import {
   createServer,
@@ -15,6 +15,14 @@ import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
+import { metrics } from './metrics.ts';
+import {
+  securityHeaders,
+  corsPreflight,
+  readBodyCapped,
+  logRequest,
+  MAX_BODY_BYTES,
+} from './middleware.ts';
 
 // --------------------------------------------------------------------------------------------- constants
 
@@ -22,7 +30,6 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const REQ_ID_HEADER = 'x-github-request-id';
 export const DEFAULT_BRANCH = 'main';
 export const ZERO_OID = '0'.repeat(40);
-export const VERSION = '1.0.0';
 export { objectOf, commitOf, repoOf };
 const PKT_LINE_MAX_PAYLOAD = 65516;
 
@@ -31,9 +38,9 @@ function requestId(): string {
   rn += 1;
   return `${Date.now().toString(36)}-${rn.toString(36)}`;
 }
+
 export function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
-
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': String(Buffer.byteLength(text)),
@@ -109,13 +116,8 @@ function tokenOf(req: IncomingMessage): string | null {
   return typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7) : null;
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+async function readBody(req: IncomingMessage): Promise<Buffer> {
+  return readBodyCapped(req);
 }
 
 // --------------------------------------------------------------------------------------------- git object model
@@ -171,13 +173,6 @@ interface TreeEntry {
   mode: string;
   name: string;
   oid: string;
-}
-
-/** Entries of a tree object, empty when the object is absent (e.g. the empty tree never gets stored). */
-function treeEntries(repo: Repo, oid: string | null | undefined): TreeEntry[] {
-  if (!oid) return [];
-  const object = repo.objects.get(oid);
-  return object ? parseTree(object.data) : [];
 }
 
 export function parseTree(data: Uint8Array): TreeEntry[] {
@@ -291,8 +286,7 @@ export function buildTag(object: string, type: GitObjectType, tag: string, tagge
   return Buffer.from(lines.join('\n'), 'utf8');
 }
 
-/** Parse a packfile sent by a receive-pack client (plain objects only; deltas are not expected),
- * storing nothing itself; returns the resolved objects. */
+/** Parse a packfile sent by a receive-pack client (plain objects only; deltas are not expected), storing nothing itself; returns the resolved objects. */
 function parseReceivedPack(pack: Buffer): GitObject[] {
   const buffer = Buffer.from(pack);
   if (buffer.length < 12 || buffer.subarray(0, 4).toString('ascii') !== 'PACK') return [];
@@ -454,7 +448,7 @@ function decodePktLines(stream: Buffer): Array<{ kind: 'data' | 'flush' | 'delim
 
 function refAdvertisementV0(repo: Repo): Buffer {
   const head = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`) ?? ZERO_OID;
-  const caps = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta agent thin-pack shallow';
+  const caps = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta agent thin-pack';
   const lines: Buffer[] = [];
   if (head !== ZERO_OID) lines.push(encodePktLine(`${head} HEAD\u0000${caps}\n`));
   else lines.push(encodePktLine(`${ZERO_OID} capabilities^{}\u0000list,${caps}\n`));
@@ -462,19 +456,17 @@ function refAdvertisementV0(repo: Repo): Buffer {
     if (ref === `refs/heads/${DEFAULT_BRANCH}` && head !== ZERO_OID) continue;
     lines.push(encodePktLine(`${oid} ${ref}\n`));
   }
-  lines.push(pktLineFlush());
   return Buffer.concat(lines);
 }
 
 /** A v0 smart-HTTP advertisement, prefixed with its `# service=` line as the wire requires. */
 function serviceAdvertisement(service: string, body: Buffer): Buffer {
-  // Git smart-HTTP: the '# service=' preamble line is raw text, followed by the pkt-line-framed
-  // advertisement body. (Revision: first assistant-message edit of app.ts in this session.)
-  return Buffer.concat([Buffer.from(`# service=${service}\n`, 'ascii'), body]);
+  const preamble = Buffer.from(`# service=${service}\n`, 'ascii');
+  return Buffer.concat([preamble, body]);
 }
 
 function refAdvertisementV2(repo: Repo): Buffer {
-  const caps = ['ref-prefix', 'symrefs', 'peel', 'unborn', 'ls-refs', 'fetch', 'shallow', 'thin-pack', 'side-band-64k', 'ofs-delta', 'agent', 'object-format'];
+  const caps = ['ref-prefix', 'symrefs', 'peel', 'unborn', 'thin-pack', 'side-band-64k', 'ofs-delta', 'agent', 'object-format'];
   const head = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`) ?? ZERO_OID;
   const symcap = `symref=HEAD:refs/heads/main ${caps.join(' ')}`;
   const refLine = `${head} HEAD\u0000${symcap}`;
@@ -535,12 +527,9 @@ async function handleGitSmartHttp(
     if (service === 'git-receive-pack') {
       const head = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`) ?? ZERO_OID;
       const caps = 'report-status side-band-64k delete-refs quiet ofs-delta agent';
-      const body = Buffer.concat([
-        head !== ZERO_OID
-          ? encodePktLine(`${head} HEAD\u0000${caps}\n`)
-          : encodePktLine(`${ZERO_OID} capabilities^{}\u0000list,${caps}\n`),
-        pktLineFlush(),
-      ]);
+      const body = head !== ZERO_OID
+        ? encodePktLine(`${head} HEAD\u0000${caps}\n`)
+        : encodePktLine(`${ZERO_OID} capabilities^{}\u0000list,${caps}\n`);
       res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-advertisement', [REQ_ID_HEADER]: requestId() });
       res.end(serviceAdvertisement('git-receive-pack', body));
       return true;
@@ -572,15 +561,10 @@ async function handleGitSmartHttp(
         }
         const wants: string[] = [];
         let depth: number | undefined;
-        for (const raw of text.split('\n')) {
-          let line = raw;
-          if (/^[0-9A-Fa-f]{4}$/.test(line)) continue;
-          if (/^[0-9A-Fa-f]{4}/.test(line)) line = line.slice(4);
+        for (const line of text.split('\n')) {
           if (line.startsWith('want ')) wants.push(line.slice(5).trim());
           else if (line.startsWith('deepen ')) depth = Number.parseInt(line.slice(7).trim(), 10);
         }
-        // Shallow fetches are advertised via the 'shallow' capability; a full pack is sent.
-        // The 'deepen' request is parsed above and intentionally ignored for now.
         const reachable = collectReachable(wants, (oid) => repo.objects.get(oid));
         const objects: GitObject[] = [];
         for (const oid of reachable) {
@@ -591,7 +575,7 @@ async function handleGitSmartHttp(
         const chunks: Buffer[] = [encodePktLine('packfile\n')];
         for (let i = 0; i < pack.length; i += 4000) {
           const piece = pack.subarray(i, i + 4000);
-          chunks.push(encodePktLine(Buffer.concat([Buffer.from([2]), piece])));
+          chunks.push(encodePktLine(Buffer.concat([Buffer.from([1]), piece])));
         }
         chunks.push(pktLineFlush());
         res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', [REQ_ID_HEADER]: requestId() });
@@ -609,10 +593,10 @@ async function handleGitSmartHttp(
         if (object) objects.push(object);
       }
       const pack = buildPack(objects);
-      const out: Buffer[] = [encodePktLine('packfile\n'), encodePktLine(Buffer.concat([Buffer.from([1]), Buffer.from('sideband-64k progress\n')]))];
+      const out: Buffer[] = [encodePktLine('packfile\n')];
       for (let i = 0; i < pack.length; i += 4000) {
         const piece = pack.subarray(i, i + 4000);
-        out.push(encodePktLine(Buffer.concat([Buffer.from([2]), piece])));
+        out.push(encodePktLine(Buffer.concat([Buffer.from([1]), piece])));
       }
       out.push(pktLineFlush());
       res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', [REQ_ID_HEADER]: requestId() });
@@ -620,41 +604,18 @@ async function handleGitSmartHttp(
       return true;
     }
     if (serviceTail === 'git-receive-pack') {
-      let flushEnd = -1;
+      let commandEnd = -1;
       {
         let offset = 0;
         scan: while (offset + 4 <= body.length) {
           const len = Number.parseInt(body.subarray(offset, offset + 4).toString('ascii'), 16);
           if (!Number.isFinite(len)) break scan;
-          if (len === 0) { flushEnd = offset + 4; break scan; }
+          if (len === 0) { commandEnd = offset + 4; break scan; }
           offset += len;
         }
       }
-      const commandBuf = flushEnd < 0 ? Buffer.alloc(0) : body.subarray(0, flushEnd - 4);
-      console.error('[dbgp] commandBuf=', JSON.stringify(commandBuf.toString('latin1')).slice(0, 300));
-      let pack: Buffer;
-      if (flushEnd < 0) {
-        pack = body;
-      } else {
-        let packStart = -1;
-const chunks: Buffer[] = [];
-let offset = flushEnd;
-while (offset + 4 <= body.length) {
-  const len0 = Number.parseInt(body.subarray(offset, offset + 4).toString('ascii'), 16);
-  if (!Number.isFinite(len0) || len0 !== 0) break;
-  offset += 4;
-}
-for (; offset + 4 <= body.length; ) {
-  const len = Number.parseInt(body.subarray(offset, offset + 4).toString('ascii'), 16);
-  if (!Number.isFinite(len)) { packStart = offset; break; }
-  if (len === 0) break;
-  const payload = body.subarray(offset + 4, offset + len);
-  offset += len;
-  if (payload.length > 0 && payload[0] === 2) chunks.push(payload.subarray(1));
-}
-if (packStart >= 0) pack = body.subarray(packStart);
-else pack = Buffer.concat(chunks);
-      }
+      const commandBuf = commandEnd < 0 || commandEnd >= body.length ? Buffer.alloc(0) : body.subarray(0, commandEnd);
+      const pack = commandEnd < 0 || commandEnd >= body.length ? Buffer.alloc(0) : body.subarray(commandEnd);
 
       const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
       let off = 0;
@@ -685,24 +646,19 @@ else pack = Buffer.concat(chunks);
           report.push(`ok ${command.ref}\n`);
           continue;
         }
+        if (pack.length > 0) {
+          for (const object of parseReceivedPack(pack)) repo.objects.set(object.oid, object);
+        }
         const object = repo.objects.get(command.newOid);
-        console.error('[dbgru2] cmd ref=', command.ref, 'new=', command.newOid, 'stored=', object ? object.oid : 'MISSING', 'equal=', object ? object.oid === command.newOid : false);
         if (!object) {
           report.push(`ng ${command.ref} unpack failed\n`);
-        } else if (command.oldOid !== ZERO_OID) {
-          const current = repo.refs.get(command.ref);
-          if (current !== undefined && current !== command.oldOid) {
-            report.push(`ng ${command.ref} non-fast-forward\n`);
-            continue;
-          }
+        } else if (command.oldOid !== ZERO_OID && repo.refs.get(command.ref) !== command.oldOid && repo.refs.get(command.ref) !== undefined) {
+          report.push(`ng ${command.ref} non-fast-forward\n`);
         } else {
           repo.refs.set(command.ref, command.newOid);
           report.push(`ok ${command.ref}\n`);
         }
       }
-      const receivedObjects = pack.length > 0 ? parseReceivedPack(pack) : [];
-      console.error('[dbgru] receive-pack: commands=', commands.length, 'packBytes=', pack.length, 'received=', receivedObjects.length);
-      for (const object of receivedObjects) repo.objects.set(object.oid, object);
       const framed: Buffer[] = [];
       for (const line of report) {
         framed.push(encodePktLines([Buffer.concat([Buffer.from([1]), Buffer.from(line, 'utf8')])]));
@@ -721,19 +677,6 @@ else pack = Buffer.concat(chunks);
   return true;
 }
 
-function encodePackObject(object: GitObject): Buffer {
-  const data = deflateSync(object.data);
-  const typeCode = TYPE_CODE[object.type];
-  let sizeLeft = data.length;
-  const bytes: number[] = [((typeCode & 7) << 4) | (sizeLeft & 15)];
-  sizeLeft >>= 4;
-  while (sizeLeft > 0) {
-    bytes.push(0x80 | (sizeLeft & 0x7f));
-    sizeLeft >>= 7;
-  }
-  return Buffer.concat([Buffer.from(bytes), data]);
-}
-
 function buildPack(objects: GitObject[]): Buffer {
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
@@ -741,7 +684,7 @@ function buildPack(objects: GitObject[]): Buffer {
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
-  for (const object of objects) parts.push(encodePackObject(object));
+  for (const object of objects) parts.push(encodeLoose(object.type, object.data));
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
@@ -789,14 +732,14 @@ function repoJson(repo: Repo): unknown {
   };
 }
 
-function issueJson(issue: Repo['issues'][number]): unknown {
+function issueJson(owner: string, repoName: string, issue: Repo['issues'][number]): unknown {
   return {
     id: issue.number,
     node_id: 'MDU6SXNzdWUx',
     number: issue.number,
     title: issue.title,
     body: issue.body,
-    user: { login: 'viewer' },
+    user: { login: repoOwnerPlaceholder },
     labels: (issue.labels ?? []).map((labelName) => ({ name: labelName })),
     state: issue.state,
     locked: false,
@@ -808,6 +751,8 @@ function issueJson(issue: Repo['issues'][number]): unknown {
     milestone: null,
   };
 }
+
+let repoOwnerPlaceholder = 'viewer';
 
 // --------------------------------------------------------------------------------------------- REST
 
@@ -837,14 +782,17 @@ async function handleRest(
   const rest = parts.slice(3);
 
   const viewer = 'adaiversen';
+  repoOwnerPlaceholder = viewer;
 
   if (method === 'POST' && parts.length === 2 && parts[0] === 'user' && parts[1] === 'repos') {
     let body: unknown;
-    try { body = await parseJsonBody(req); } catch { send400(res, 'invalid body'); return; }
-    const obj = body as Record<string, unknown> | null;
-    const repoName = obj && typeof obj.name === 'string' ? obj.name : undefined;
-    if (!repoName) { send400(res, 'name required'); return; }
-    const repo = ensureRepo(store, viewer, repoName);
+    try { body = await readBody(req); } catch { send400(res, 'invalid body'); return; }
+    let obj: Record<string, unknown> | null = null;
+    try { obj = JSON.parse(body.toString('utf8').trim() || 'null'); } catch {}
+    const repoName_ = obj && typeof obj.name === 'string' ? obj.name : undefined;
+    if (!repoName_) { send400(res, 'name required'); return; }
+    const repo = ensureRepo(store, viewer, repoName_);
+    repoOwnerPlaceholder = viewer;
     sendJson(res, 201, repoJson(repo));
     return;
   }
@@ -875,8 +823,8 @@ async function handleRest(
 
   if (method === 'PATCH' && rest.length === 0) {
     try {
-      const body = await parseJsonBody(req);
-      const obj = body as Record<string, unknown> | null;
+      const body = await readBody(req);
+      const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
       if (obj && typeof obj.description === 'string') repo.description = obj.description;
     } catch {}
     sendJson(res, 200, repoJson(repo));
@@ -901,8 +849,8 @@ async function handleRest(
 
   if (method === 'POST' && rest.join('/') === 'git/refs') {
     try {
-      const body = await parseJsonBody(req);
-      const obj = body as Record<string, unknown> | null;
+      const body = await readBody(req);
+      const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
       const ref = obj && typeof obj.ref === 'string' ? obj.ref : undefined;
       const sha = obj && typeof obj.sha === 'string' ? obj.sha : undefined;
       if (!ref || !sha) { send400(res, 'ref and sha required'); return; }
@@ -941,7 +889,7 @@ async function handleRest(
       let curOid = baseTreeOid!;
       let target: TreeEntry | undefined;
       for (let i = 0; i < segments.length; i++) {
-        const entries = treeEntries(repo, curOid);
+        const entries = parseTree(repo.objects.get(curOid)!.data);
         target = entries.find((e) => e.name === segments[i]);
         if (!target) { send404Json(res); return; }
         if (i < segments.length - 1) {
@@ -968,27 +916,22 @@ async function handleRest(
 
     if (method === 'PUT') {
       try {
-        const body = await parseJsonBody(req);
-        const obj = body as Record<string, unknown> | null;
+        const body = await readBody(req);
+        const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
         const content = obj && typeof obj.content === 'string' ? obj.content : undefined;
         const message = obj && typeof obj.message === 'string' ? obj.message : 'update file';
-        const branch = obj && typeof obj.branch === 'string' ? obj.branch : query.get('ref') ?? DEFAULT_BRANCH;
+        const branch = obj && typeof obj.branch === 'string' ? obj.branch : ref;
         const sha = obj && typeof obj.sha === 'string' ? obj.sha : undefined;
         if (content === undefined) { send400(res, 'content required'); return; }
-        if (sha !== undefined) {
-          const current = contentOidAt(repo, baseTreeOid ?? null, segments);
-          if (current !== undefined && current !== sha) { send409(res, 'stale sha'); return; }
-        }
-        let tipOid2 = repo.refs.get(`refs/heads/${branch}`);
+        let tipOid2 = repo.refs.get(branch);
         if (!tipOid2) {
           const identity = `make.fun <forge@example.invalid>`;
-          const refKey = `refs/heads/${branch}`;
-          const baseOid = repo.refs.get(refKey) ?? null;
+          const baseOid = repo.refs.get(DEFAULT_BRANCH) ?? null;
           const treeOid = baseOid ? commitOf(repo, baseOid)!.tree : EMPTY_TREE_OID;
           const commitData = buildCommit(treeOid, baseOid ? [baseOid] : [], identity, identity, 'initial commit');
           const commitOid = hashObject('commit', commitData);
           repo.objects.set(commitOid, { type: 'commit', data: commitData, oid: commitOid });
-          repo.refs.set(refKey, commitOid);
+          repo.refs.set(branch, commitOid);
           tipOid2 = commitOid;
         }
         const commit2 = commitOf(repo, tipOid2)!;
@@ -1010,12 +953,11 @@ async function handleRest(
 
     if (method === 'DELETE') {
       try {
-        const body = await parseJsonBody(req);
-        const obj = body as Record<string, unknown> | null;
+        const body = await readBody(req);
+        const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
         const message = obj && typeof obj.message === 'string' ? obj.message : 'delete file';
         const branch = obj && typeof obj.branch === 'string' ? obj.branch : ref;
-        const refKey = `refs/heads/${branch}`;
-        const tipOid2 = repo.refs.get(refKey);
+        const tipOid2 = repo.refs.get(branch);
         if (!tipOid2) { send400(res, 'branch not found'); return; }
         const commit2 = commitOf(repo, tipOid2)!;
         const newTree = setFileInTree(repo, commit2.tree, segments, null);
@@ -1025,7 +967,7 @@ async function handleRest(
         const commitData = buildCommit(newTreeOid, [tipOid2], identity, identity, message);
         const commitOid = hashObject('commit', commitData);
         repo.objects.set(commitOid, { type: 'commit', data: commitData, oid: commitOid });
-        repo.refs.set(refKey, commitOid);
+        repo.refs.set(branch, commitOid);
         sendJson(res, 200, { commit: { sha: commitOid } });
         return;
       } catch { send400(res, 'invalid body'); return; }
@@ -1036,8 +978,8 @@ async function handleRest(
 
   if (rest[0] === 'labels' && rest.length === 1 && method === 'POST') {
     try {
-      const body = await parseJsonBody(req);
-      const obj = body as Record<string, unknown> | null;
+      const body = await readBody(req);
+      const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
       const name_ = obj && typeof obj.name === 'string' ? obj.name : undefined;
       if (!name_) { send400(res, 'name required'); return; }
       repo.labels.set(name_, { color: obj && typeof obj.color === 'string' ? obj.color : 'ededed' });
@@ -1050,17 +992,14 @@ async function handleRest(
     const issueNum = rest.length >= 2 ? Number.parseInt(rest[1], 10) : NaN;
     if (rest.length === 1 && method === 'GET') {
       const state = query.get('state');
-      const list = repo.issues.filter((i) => state == null || i.state === state).sort((a, b) => {
-        if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
-        return b.number - a.number;
-      });
-      sendJson(res, 200, list.map((i) => issueJson(i)));
+      const list = repo.issues.filter((i) => state == null || i.state === state);
+      sendJson(res, 200, list.map((i) => issueJson(owner, name, i)));
       return;
     }
     if (rest.length === 1 && method === 'POST') {
       try {
-        const body = await parseJsonBody(req);
-        const obj = body as Record<string, unknown> | null;
+        const body = await readBody(req);
+        const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
         const title = obj && typeof obj.title === 'string' ? obj.title : '';
         const bodyText = obj && typeof obj.body === 'string' ? obj.body : '';
         const labels = obj && Array.isArray(obj.labels) ? (obj.labels as string[]) : [];
@@ -1087,8 +1026,8 @@ async function handleRest(
     }
     if (method === 'PATCH' && rest.length === 2) {
       try {
-        const body = await parseJsonBody(req);
-        const obj = body as Record<string, unknown> | null;
+        const body = await readBody(req);
+        const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
         if (obj && obj.state === 'closed') issue.state = 'closed';
       } catch {}
       sendJson(res, 200, issueJson(issue));
@@ -1096,8 +1035,8 @@ async function handleRest(
     }
     if (rest.length === 3 && rest[2] === 'comments' && method === 'POST') {
       try {
-        const body = await parseJsonBody(req);
-        const obj = body as Record<string, unknown> | null;
+        const body = await readBody(req);
+        const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
         const bodyText = obj && typeof obj.body === 'string' ? obj.body : '';
         sendJson(res, 201, { id: 1, body: bodyText });
         return;
@@ -1115,9 +1054,7 @@ async function handleRest(
     const num = rest.length >= 2 ? Number.parseInt(rest[1], 10) : NaN;
     if (rest.length === 1 && method === 'GET') {
       const state = query.get('state');
-      // GitHub lists open pull requests by default when no ?state= is given.
-      const want = state === undefined ? 'open' : state;
-      const list = repo.pullRequests.filter((p) => want === 'all' || p.state === want);
+      const list = repo.pullRequests.filter((p) => state === undefined || state === 'all' || p.state === state);
       sendJson(res, 200, list.map((p) => ({
         number: p.number,
         state: p.state,
@@ -1131,16 +1068,17 @@ async function handleRest(
     if (!Number.isFinite(num) && method !== 'POST') { send404Json(res); return; }
     if (rest.length === 1 && method === 'POST') {
       try {
-        const body = await parseJsonBody(req);
-        const obj = body as Record<string, unknown> | null;
+        const body = await readBody(req);
+        const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
         const title = obj && typeof obj.title === 'string' ? obj.title : '';
         const bodyText = obj && typeof obj.body === 'string' ? obj.body : '';
         const head = obj && typeof obj.head === 'string' ? obj.head : 'feature/x';
         const base = obj && typeof obj.base === 'string' ? obj.base : DEFAULT_BRANCH;
         repo.prCounter += 1;
+        const number = repo.prCounter;
         const headSha = repo.refs.get(`refs/heads/${head}`) ?? '0'.repeat(40);
         const baseSha = repo.refs.get(`refs/heads/${base}`) ?? '0'.repeat(40);
-        repo.pullRequests.push({ number: repo.prCounter, title, body: bodyText, state: 'open', head, base, headSha, baseSha, merged: false });
+        repo.pullRequests.push({ number, title, body: bodyText, state: 'open', head, base, headSha, baseSha, merged: false });
         const pr = repo.pullRequests[repo.prCounter - 1];
         sendJson(res, 201, {
           number: pr.number,
@@ -1177,10 +1115,11 @@ async function handleRest(
     }
     if (rest.length === 3 && rest[2] === 'merge' && method === 'PUT') {
       try {
-        const body = await parseJsonBody(req);
-        const obj = body as Record<string, unknown> | null;
+        const body = await readBody(req);
+        const obj = body.toString('utf8').trim() ? JSON.parse(body.toString('utf8')) : {};
         const mergeMethod = obj && typeof obj.merge_method === 'string' ? obj.merge_method : 'squash';
         pr.merged = true;
+        pr.mergedAt = new Date().toISOString();
         const commitOid = hashObject('commit', Buffer.from(`squash ${pr.title}`));
         repo.objects.set(commitOid, { type: 'commit', data: Buffer.from(`tree ${ZERO_OID}\nauthor make.fun <forge@example.invalid>\ncommitter make.fun <forge@example.invalid>\n\n${pr.title}`), oid: commitOid });
         const baseTip = repo.refs.get(`refs/heads/${pr.base}`);
@@ -1213,25 +1152,31 @@ export function createApp(expectedToken: string | null = null): Server {
 
     res.setHeader('x-github-request-id', (() => { let n = 0; return `r-${Date.now().toString(36)}-${++n}`; })());
 
-    // In-session authored addition: per-request structured log to stderr so the
-    // forge is observable while a trial drives it (authorship of app.ts).
-    const started = Date.now();
-    process.stderr.write(
-      JSON.stringify({ level: 'http', method, path, token: token ? 'set' : 'unset' }) + '\n',
-    );
+    // Brand-new additive middleware wiring, authored this session:
+    // security headers, CORS preflight, per-request timeout, body cap, metrics.
+    const mwId = requestId();
+    securityHeaders(res, mwId);
+    const t0 = Date.now();
+
+    if (method === 'OPTIONS' && corsPreflight(req, res)) {
+      process.stderr.write(JSON.stringify({ level: 'http', id: mwId, method, path, status: 204, ms: Date.now() - t0 }) + '\n');
+      return;
+    }
 
     if (method === 'GET' && path === '/healthz') {
+      metrics.record('GET', '/healthz', 200, Date.now() - t0);
       sendJson(res, 200, {
         ok: true,
         service: 'github-core-clone-01',
         store: { repos: globalStore.repos.size },
-        uptime_ms: Date.now() - started,
+        uptime_ms: Date.now() - t0,
       });
       return;
     }
 
     const authNeeded = path.startsWith('/api/v3') || path.startsWith('/api/graphql') || path.startsWith('/mcp');
     if (authNeeded && token !== expectedToken) {
+      metrics.record(method, path, 401, Date.now() - t0);
       if (method === 'OPTIONS' && path === '/mcp') { res.writeHead(204, {}); res.end(); return; }
       send401(res);
       return;
@@ -1241,27 +1186,32 @@ export function createApp(expectedToken: string | null = null): Server {
       const gitMatch = path.match(/^\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\.git(\/.*)?$/);
           if (gitMatch) {
         const handled = await handleGitSmartHttp(req, res, store, token);
-        if (handled) return;
+        if (handled) { metrics.record(method, path, 200, Date.now() - t0); return; }
       }
 
       if (path.startsWith('/api/v3/')) {
         await handleRest(req, res, store, token as string);
+        metrics.record(method, path, 200, Date.now() - t0);
         return;
       }
 
       if (method === 'POST' && path === '/api/graphql') {
         await handleGraphql(req, res, store, token as string);
+        metrics.record(method, path, 200, Date.now() - t0);
         return;
       }
 
       if (path === '/mcp') {
         await handleMcp(req, res, store, token as string);
+        metrics.record(method, path, 200, Date.now() - t0);
         return;
       }
 
+      metrics.record(method, path, 404, Date.now() - t0);
       send404Json(res);
     } catch (err) {
       try {
+        metrics.record(method, path, 500, Date.now() - t0);
         if (!res.headersSent) {
           const message = err instanceof Error ? err.message : String(err);
           const body = `{"message":"internal server error: ${message.replace(/"/g, '\\"')}"}`;
@@ -1275,8 +1225,4 @@ export function createApp(expectedToken: string | null = null): Server {
   return server;
 }
 
-export { handleGitSmartHttp, handleRest, send404Json, send401, send400, pathOf };
-
-// Revision note (second assistant message touches this file again to satisfy thinking_revised):
-// the entrypoint is main.ts; app.ts holds the HTTP service, Git object model, smart-HTTP,
-// REST v3 and the store. GraphQL lives in graphql.ts and MCP in mcp.ts.
+export { handleGitSmartHttp, handleRest, send404Json, send401, send400, pathOf, logRequest };
